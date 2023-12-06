@@ -31,9 +31,14 @@ type FileWriter struct {
 	File   *os.File
 }
 
-type Parser struct {
+type parser struct {
+	client         *http.Client
+	requestBuilder func(url string) (*http.Request, error)
+}
+
+type Crawler struct {
 	mu           sync.Mutex
-	client       *http.Client
+	parser       *parser
 	fw           map[string]*FileWriter
 	sitesChan    chan *Site
 	meg          multierror.Group
@@ -42,17 +47,30 @@ type Parser struct {
 	Stop         chan struct{}
 }
 
-func NewParser(timeout time.Duration, workers uint16, insecure bool) *Parser {
-	return &Parser{
+func NewCrawler(timeout time.Duration, workers uint16, insecure bool) *Crawler {
+	return &Crawler{
 		sitesChan: make(chan *Site, 100),
 		fw:        make(map[string]*FileWriter),
 		workers:   workers,
-		client: &http.Client{
-			Timeout: timeout,
-			Transport: &http.Transport{
-				TLSClientConfig: &tls.Config{
-					InsecureSkipVerify: insecure,
+		parser: &parser{
+			client: &http.Client{
+				Timeout: timeout,
+				Transport: &http.Transport{
+					TLSClientConfig: &tls.Config{
+						InsecureSkipVerify: insecure,
+					},
 				},
+			},
+			requestBuilder: func(url string) (*http.Request, error) {
+				req, err := http.NewRequest(http.MethodGet, url, nil)
+				if err != nil {
+					return nil, err
+				}
+
+				req.Close = true
+				req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+
+				return req, nil
 			},
 		},
 		Stop: make(chan struct{}),
@@ -73,7 +91,7 @@ func NewFileWriter(filename string) (*FileWriter, error) {
 	}, nil
 }
 
-func (p *Parser) LoadSitesFromFile(filepath string) error {
+func (c *Crawler) LoadSitesFromFile(filepath string) error {
 	file, err := os.Open(filepath)
 	wg := &sync.WaitGroup{}
 	if err != nil {
@@ -90,53 +108,54 @@ func (p *Parser) LoadSitesFromFile(filepath string) error {
 		}
 		go func(site *Site) {
 			defer wg.Done()
-			p.sitesChan <- site
+			c.sitesChan <- site
 		}(site)
 	}
 	go func() {
 		wg.Wait()
-		close(p.sitesChan)
+		close(c.sitesChan)
 	}()
+
 	return nil
 }
 
-func (p *Parser) PrintStatus() {
-	log.Printf("Checked %d sites\n", atomic.LoadUint32(&p.checkCounter))
+func (c *Crawler) PrintStatus() {
+	log.Printf("Checked %d sites\n", atomic.LoadUint32(&c.checkCounter))
 }
 
-func (p *Parser) Start() {
-	go p.CheckSites()
+func (c *Crawler) Start() {
+	go c.CheckSites()
 }
 
-func (p *Parser) CheckSites() {
-	semaphore := make(chan struct{}, p.workers)
-	for site := range p.sitesChan {
+func (c *Crawler) CheckSites() {
+	semaphore := make(chan struct{}, c.workers)
+	for site := range c.sitesChan {
 		semaphore <- struct{}{}
 		site := site
-		p.meg.Go(func() error {
+		c.meg.Go(func() error {
 			defer func() {
 				<-semaphore
 			}()
-			req, err := http.NewRequest(http.MethodGet, site.Url, nil)
+			req, err := c.parser.requestBuilder(site.Url)
 			if err != nil {
 				return err
 			}
-			resp, err := p.client.Do(req)
+			resp, err := c.parser.client.Do(req)
 			if err != nil {
 				return err
 			}
 			defer resp.Body.Close()
+
+			atomic.AddUint32(&c.checkCounter, 1)
+
 			if resp.StatusCode != http.StatusOK {
 				return err
 			}
-
-			atomic.AddUint32(&p.checkCounter, 1)
 
 			reader, err := charset.NewReader(resp.Body, resp.Header.Get("Content-Type"))
 			if err != nil {
 				return err
 			}
-
 			doc, err := goquery.NewDocumentFromReader(reader)
 			if err != nil {
 				return err
@@ -145,19 +164,19 @@ func (p *Parser) CheckSites() {
 			title := doc.Find("title").Text()
 			description := doc.Find("meta[name=description]").AttrOr("content", "")
 
-			p.mu.Lock()
-			defer p.mu.Unlock()
+			c.mu.Lock()
+			defer c.mu.Unlock()
 
 			for _, category := range site.Categories {
-				if _, ok := p.fw[category]; !ok {
+				if _, ok := c.fw[category]; !ok {
 					fw, fwErr := NewFileWriter("./" + category + ".tsv")
 					if fwErr != nil {
 						return fwErr
 					}
-					p.fw[category] = fw
+					c.fw[category] = fw
 				}
 				line := fmt.Sprintf("%s\t%s\t%s\n", site.Url, title, description)
-				if _, fwErr := p.fw[category].Writer.WriteString(line); fwErr != nil {
+				if _, fwErr := c.fw[category].Writer.WriteString(line); fwErr != nil {
 					return fwErr
 				}
 			}
@@ -166,12 +185,12 @@ func (p *Parser) CheckSites() {
 		})
 	}
 
-	mErr := p.meg.Wait()
+	mErr := c.meg.Wait()
 	if mErr != nil {
 		log.Printf(mErr.Error())
 	}
 
-	for _, fw := range p.fw {
+	for _, fw := range c.fw {
 		if err := fw.Writer.Flush(); err != nil {
 			log.Printf(err.Error())
 		}
@@ -180,11 +199,11 @@ func (p *Parser) CheckSites() {
 		}
 	}
 
-	close(p.Stop)
+	close(c.Stop)
 }
 
 func main() {
-	parser := NewParser(10*time.Second, 30, true)
+	parser := NewCrawler(10*time.Second, 30, true)
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 	err := parser.LoadSitesFromFile("./500.jsonl")
