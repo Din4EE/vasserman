@@ -186,6 +186,7 @@ func (p *Parser) CheckSites() {
 func main() {
 	parser := NewParser(10*time.Second, 30, true)
 	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
 	err := parser.LoadSitesFromFile("./500.jsonl")
 	if err != nil {
 		panic(err)
