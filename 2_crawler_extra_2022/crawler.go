@@ -56,7 +56,12 @@ type Crawler struct {
 	writerType   string
 }
 
-func NewCrawler(timeout time.Duration, rps int64, insecure bool, writerType string) *Crawler {
+func NewCrawler(timeout time.Duration, rps uint64, insecure bool, writerType string) (*Crawler, error) {
+
+	if rps <= 0 {
+		return nil, fmt.Errorf("rps cannot be %d", rps)
+	}
+
 	return &Crawler{
 		writerType: writerType,
 		parser: &parser{
@@ -81,7 +86,7 @@ func NewCrawler(timeout time.Duration, rps int64, insecure bool, writerType stri
 			},
 			rateLimit: time.Tick(time.Second / time.Duration(rps)),
 		},
-	}
+	}, nil
 }
 
 func NewFileWriter(filename string) (DataWriter, error) {
@@ -251,17 +256,19 @@ func (c *Crawler) checkSites(sitesChan <-chan *Site) {
 
 func (c *Crawler) createWriterForCategory(category string) (DataWriter, error) {
 	switch c.writerType {
-	case "console":
-		return NewConsoleWriter()
 	case "file":
 		return NewFileWriter(fmt.Sprintf("%s.tsv", category))
+	default:
+		return NewConsoleWriter()
 	}
-	return nil, fmt.Errorf("unknown writer type: %s", c.writerType)
 }
 
 func main() {
-	crawler := NewCrawler(10*time.Second, 50, true, "console")
-	if err := crawler.Start("./500.jsonl"); err != nil {
+	crawler, err := NewCrawler(10*time.Second, 30, true, "")
+	if err != nil {
+		log.Fatalf(err.Error())
+	}
+	if err = crawler.Start("./500.jsonl"); err != nil {
 		log.Fatalf(err.Error())
 	}
 }
