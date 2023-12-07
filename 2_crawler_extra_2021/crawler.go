@@ -26,6 +26,16 @@ type Site struct {
 	Ctime           int64    `json:"ctime"`
 }
 
+type DataWriter interface {
+	Write(data string) error
+	Flush() error
+	Close() error
+}
+
+type ConsoleWriter struct {
+	Writer *bufio.Writer
+}
+
 type FileWriter struct {
 	Writer *bufio.Writer
 	File   *os.File
@@ -34,24 +44,21 @@ type FileWriter struct {
 type parser struct {
 	client         *http.Client
 	requestBuilder func(url string) (*http.Request, error)
+	rateLimit      <-chan time.Time
 }
 
 type Crawler struct {
 	mu           sync.Mutex
 	parser       *parser
-	fw           map[string]*FileWriter
-	sitesChan    chan *Site
 	meg          multierror.Group
+	wg           sync.WaitGroup
 	checkCounter uint32
-	workers      uint16
-	Stop         chan struct{}
+	writerType   string
 }
 
-func NewCrawler(timeout time.Duration, workers uint16, insecure bool) *Crawler {
+func NewCrawler(timeout time.Duration, rps int64, insecure bool, writerType string) *Crawler {
 	return &Crawler{
-		sitesChan: make(chan *Site, 100),
-		fw:        make(map[string]*FileWriter),
-		workers:   workers,
+		writerType: writerType,
 		parser: &parser{
 			client: &http.Client{
 				Timeout: timeout,
@@ -72,70 +79,111 @@ func NewCrawler(timeout time.Duration, workers uint16, insecure bool) *Crawler {
 
 				return req, nil
 			},
+			rateLimit: time.Tick(time.Second / time.Duration(rps)),
 		},
-		Stop: make(chan struct{}),
 	}
 }
 
-func NewFileWriter(filename string) (*FileWriter, error) {
+func NewFileWriter(filename string) (DataWriter, error) {
 	file, err := os.OpenFile(filename, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
 		return nil, err
 	}
 
-	writer := bufio.NewWriter(file)
-
 	return &FileWriter{
+		Writer: bufio.NewWriter(file),
 		File:   file,
-		Writer: writer,
 	}, nil
 }
 
-func (c *Crawler) LoadSitesFromFile(filepath string) error {
+func NewConsoleWriter() (DataWriter, error) {
+	return &ConsoleWriter{
+		Writer: bufio.NewWriter(os.Stdout),
+	}, nil
+}
+
+func (fw *FileWriter) Write(data string) error {
+	_, err := fw.Writer.WriteString(data)
+	return err
+}
+
+func (fw *FileWriter) Flush() error {
+	return fw.Writer.Flush()
+}
+
+func (fw *FileWriter) Close() error {
+	return fw.File.Close()
+}
+
+func (cw *ConsoleWriter) Write(data string) error {
+	_, err := cw.Writer.WriteString(fmt.Sprintf("%s\n", data))
+	return err
+}
+
+func (cw *ConsoleWriter) Flush() error {
+	return cw.Writer.Flush()
+}
+
+func (cw *ConsoleWriter) Close() error {
+	return nil
+}
+
+func (c *Crawler) loadSitesFromFile(filepath string) (chan *Site, error) {
 	file, err := os.Open(filepath)
-	wg := &sync.WaitGroup{}
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer file.Close()
+
+	sitesChan := make(chan *Site)
 	decoder := json.NewDecoder(file)
 	for decoder.More() {
-		wg.Add(1)
+		c.wg.Add(1)
 		var site *Site
 		err = decoder.Decode(&site)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		go func(site *Site) {
-			defer wg.Done()
-			c.sitesChan <- site
+			defer c.wg.Done()
+			sitesChan <- site
 		}(site)
 	}
 	go func() {
-		wg.Wait()
-		close(c.sitesChan)
+		c.wg.Wait()
+		close(sitesChan)
 	}()
+
+	return sitesChan, nil
+}
+
+func (c *Crawler) printStatus() {
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			log.Printf("Checked %d sites", atomic.LoadUint32(&c.checkCounter))
+		}
+	}
+}
+
+func (c *Crawler) Start(filepath string) error {
+	sitesChan, err := c.loadSitesFromFile(filepath)
+	if err != nil {
+		return err
+	}
+	c.checkSites(sitesChan)
 
 	return nil
 }
 
-func (c *Crawler) PrintStatus() {
-	log.Printf("Checked %d sites\n", atomic.LoadUint32(&c.checkCounter))
-}
-
-func (c *Crawler) Start() {
-	go c.CheckSites()
-}
-
-func (c *Crawler) CheckSites() {
-	semaphore := make(chan struct{}, c.workers)
-	for site := range c.sitesChan {
-		semaphore <- struct{}{}
+func (c *Crawler) checkSites(sitesChan <-chan *Site) {
+	wMap := make(map[string]DataWriter)
+	for site := range sitesChan {
 		site := site
 		c.meg.Go(func() error {
-			defer func() {
-				<-semaphore
-			}()
+			<-c.parser.rateLimit
 			req, err := c.parser.requestBuilder(site.Url)
 			if err != nil {
 				return err
@@ -163,21 +211,23 @@ func (c *Crawler) CheckSites() {
 
 			title := doc.Find("title").Text()
 			description := doc.Find("meta[name=description]").AttrOr("content", "")
+			if description == "" {
+				description = doc.Find("meta[property='og:description']").AttrOr("content", "")
+			}
 
 			c.mu.Lock()
 			defer c.mu.Unlock()
 
 			for _, category := range site.Categories {
-				if _, ok := c.fw[category]; !ok {
-					fw, fwErr := NewFileWriter("./" + category + ".tsv")
-					if fwErr != nil {
-						return fwErr
+				if _, ok := wMap[category]; !ok {
+					wMap[category], err = c.createWriterForCategory(category)
+					if err != nil {
+						return err
 					}
-					c.fw[category] = fw
 				}
 				line := fmt.Sprintf("%s\t%s\t%s\n", site.Url, title, description)
-				if _, fwErr := c.fw[category].Writer.WriteString(line); fwErr != nil {
-					return fwErr
+				if wErr := wMap[category].Write(line); wErr != nil {
+					return wErr
 				}
 			}
 
@@ -186,38 +236,32 @@ func (c *Crawler) CheckSites() {
 	}
 
 	mErr := c.meg.Wait()
+	for _, w := range wMap {
+		if err := w.Flush(); err != nil {
+			log.Printf(err.Error())
+		}
+		if err := w.Close(); err != nil {
+			log.Printf(err.Error())
+		}
+	}
 	if mErr != nil {
 		log.Printf(mErr.Error())
 	}
+}
 
-	for _, fw := range c.fw {
-		if err := fw.Writer.Flush(); err != nil {
-			log.Printf(err.Error())
-		}
-		if err := fw.File.Close(); err != nil {
-			log.Printf(err.Error())
-		}
+func (c *Crawler) createWriterForCategory(category string) (DataWriter, error) {
+	switch c.writerType {
+	case "console":
+		return NewConsoleWriter()
+	case "file":
+		return NewFileWriter(fmt.Sprintf("%s.tsv", category))
 	}
-
-	close(c.Stop)
+	return nil, fmt.Errorf("unknown writer type: %s", c.writerType)
 }
 
 func main() {
-	parser := NewCrawler(10*time.Second, 30, true)
-	ticker := time.NewTicker(1 * time.Second)
-	defer ticker.Stop()
-	err := parser.LoadSitesFromFile("./500.jsonl")
-	if err != nil {
-		panic(err)
-	}
-	parser.Start()
-
-	for {
-		select {
-		case <-parser.Stop:
-			return
-		case <-ticker.C:
-			parser.PrintStatus()
-		}
+	crawler := NewCrawler(10*time.Second, 50, true, "console")
+	if err := crawler.Start("./500.jsonl"); err != nil {
+		log.Fatalf(err.Error())
 	}
 }
